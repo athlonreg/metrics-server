@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
@@ -231,7 +231,7 @@ var _ = Describe("Scraper", func() {
 func metricPoint(cpu, memory uint64, time time.Time) storage.MetricsPoint {
 	return storage.MetricsPoint{
 		Timestamp:         time,
-		CumulativeCpuUsed: cpu,
+		CumulativeCPUUsed: cpu,
 		MemoryUsage:       memory,
 	}
 }

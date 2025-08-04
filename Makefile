@@ -2,6 +2,15 @@
 # --------------------------
 REGISTRY?=gcr.io/k8s-staging-metrics-server
 ARCH?=amd64
+OS?=linux
+BINARY_NAME?=metrics-server-$(OS)-$(ARCH)
+
+ifeq ($(OS),windows)
+BINARY_NAME:=$(BINARY_NAME).exe
+endif
+
+CONTAINER_CLI ?= docker
+OUTPUT_DIR?=_output
 
 # Release variables
 # ------------------
@@ -14,9 +23,23 @@ BUILD_DATE:=$(shell date -u +'%Y-%m-%dT%H:%M:%SZ')
 ALL_ARCHITECTURES=amd64 arm arm64 ppc64le s390x
 export DOCKER_CLI_EXPERIMENTAL=enabled
 
+ALL_BINARIES_PLATFORMS= $(addprefix linux/,$(ALL_ARCHITECTURES)) \
+						darwin/amd64 \
+						darwin/arm64 \
+						windows/amd64 \
+						windows/arm64
+
 # Tools versions
 # --------------
-GOLANGCI_VERSION:=1.51.2
+GOLANGCI_VERSION:=2.3.0
+
+# Tools CLI
+# ---------
+ADDLICENSE_CLI ?= go tool github.com/google/addlicense
+BENCHSTAT_CLI ?= go tool golang.org/x/perf/cmd/benchstat
+LOGCHECK_CLI ?= go tool sigs.k8s.io/logtools/logcheck
+MDTOC_CLI ?= go tool sigs.k8s.io/mdtoc
+OPENAPIGEN_CLI ?= go tool k8s.io/kube-openapi/cmd/openapi-gen
 
 # Computed variables
 # ------------------
@@ -35,8 +58,19 @@ PKG:=k8s.io/client-go/pkg
 VERSION_LDFLAGS:=-X $(PKG)/version.gitVersion=$(GIT_TAG) -X $(PKG)/version.gitCommit=$(GIT_COMMIT) -X $(PKG)/version.buildDate=$(BUILD_DATE)
 LDFLAGS:=-w $(VERSION_LDFLAGS)
 
-metrics-server: $(SRC_DEPS)
-	GOARCH=$(ARCH) CGO_ENABLED=0 go build -mod=readonly -ldflags "$(LDFLAGS)" -o metrics-server sigs.k8s.io/metrics-server/cmd/metrics-server
+metrics-server:
+	OUTPUT_DIR=. BINARY_NAME=$@ $(MAKE) build
+
+.PHONY: build
+build: $(SRC_DEPS)
+	@mkdir -p $(OUTPUT_DIR)
+	GOARCH=$(ARCH) GOOS=$(OS) CGO_ENABLED=0 go build -mod=readonly -trimpath -ldflags "$(LDFLAGS)" -o "$(OUTPUT_DIR)/$(BINARY_NAME)" sigs.k8s.io/metrics-server/cmd/metrics-server
+
+.PHONY: build-all
+build-all:
+	@for platform in $(ALL_BINARIES_PLATFORMS); do \
+		OS="$${platform%/*}" ARCH="$${platform#*/}" $(MAKE) build; \
+	done
 
 # Image Rules
 # -----------
@@ -47,8 +81,8 @@ CONTAINER_ARCH_TARGETS=$(addprefix container-,$(ALL_ARCHITECTURES))
 container:
 	# Pull base image explicitly. Keep in sync with Dockerfile, otherwise
 	# GCB builds will start failing.
-	docker pull golang:1.19.8
-	docker build -t $(REGISTRY)/metrics-server-$(ARCH):$(CHECKSUM) --build-arg ARCH=$(ARCH) --build-arg GIT_TAG=$(GIT_TAG) --build-arg GIT_COMMIT=$(GIT_COMMIT) .
+	${CONTAINER_CLI} pull golang:1.24.5
+	${CONTAINER_CLI} build -t $(REGISTRY)/metrics-server-$(ARCH):$(CHECKSUM) --build-arg ARCH=$(ARCH) --build-arg GIT_TAG=$(GIT_TAG) --build-arg GIT_COMMIT=$(GIT_COMMIT) .
 
 .PHONY: container-all
 container-all: $(CONTAINER_ARCH_TARGETS);
@@ -64,8 +98,8 @@ PUSH_ARCH_TARGETS=$(addprefix push-,$(ALL_ARCHITECTURES))
 
 .PHONY: push
 push: container
-	docker tag $(REGISTRY)/metrics-server-$(ARCH):$(CHECKSUM) $(REGISTRY)/metrics-server-$(ARCH):$(GIT_TAG)
-	docker push $(REGISTRY)/metrics-server-$(ARCH):$(GIT_TAG)
+	${CONTAINER_CLI} tag $(REGISTRY)/metrics-server-$(ARCH):$(CHECKSUM) $(REGISTRY)/metrics-server-$(ARCH):$(GIT_TAG)
+	${CONTAINER_CLI} push $(REGISTRY)/metrics-server-$(ARCH):$(GIT_TAG)
 
 .PHONY: push-all
 push-all: $(PUSH_ARCH_TARGETS) push-multi-arch;
@@ -76,9 +110,9 @@ $(PUSH_ARCH_TARGETS): push-%:
 
 .PHONY: push-multi-arch
 push-multi-arch:
-	docker manifest create --amend $(REGISTRY)/metrics-server:$(GIT_TAG) $(shell echo $(ALL_ARCHITECTURES) | sed -e "s~[^ ]*~$(REGISTRY)/metrics-server\-&:$(GIT_TAG)~g")
-	@for arch in $(ALL_ARCHITECTURES); do docker manifest annotate --arch $${arch} $(REGISTRY)/metrics-server:$(GIT_TAG) $(REGISTRY)/metrics-server-$${arch}:${GIT_TAG}; done
-	docker manifest push --purge $(REGISTRY)/metrics-server:$(GIT_TAG)
+	${CONTAINER_CLI} manifest create --amend $(REGISTRY)/metrics-server:$(GIT_TAG) $(shell echo $(ALL_ARCHITECTURES) | sed -e "s~[^ ]*~$(REGISTRY)/metrics-server\-&:$(GIT_TAG)~g")
+	@for arch in $(ALL_ARCHITECTURES); do ${CONTAINER_CLI} manifest annotate --arch $${arch} $(REGISTRY)/metrics-server:$(GIT_TAG) $(REGISTRY)/metrics-server-$${arch}:${GIT_TAG}; done
+	${CONTAINER_CLI} manifest push --purge $(REGISTRY)/metrics-server:$(GIT_TAG)
 
 # Release rules
 # -------------
@@ -90,10 +124,10 @@ release-tag:
 
 .PHONY: release-manifests
 release-manifests:
-	mkdir -p _output
-	kubectl kustomize manifests/overlays/release > _output/components.yaml
-	kubectl kustomize manifests/overlays/release-ha > _output/high-availability.yaml
-	kubectl kustomize manifests/overlays/release-ha-1.21+ > _output/high-availability-1.21+.yaml
+	mkdir -p $(OUTPUT_DIR)
+	kubectl kustomize manifests/overlays/release > $(OUTPUT_DIR)/components.yaml
+	kubectl kustomize manifests/overlays/release-ha > $(OUTPUT_DIR)/high-availability.yaml
+	kubectl kustomize manifests/overlays/release-ha-1.21+ > $(OUTPUT_DIR)/high-availability-1.21+.yaml
 
 
 # fuzz tests
@@ -112,61 +146,55 @@ test-unit:
 # Benchmarks
 # ----------
 
-HAS_BENCH_STORAGE=$(wildcard ./_output/bench_storage.txt)
+HAS_BENCH_STORAGE=$(wildcard ./$(OUTPUT_DIR)/bench_storage.txt)
 
 .PHONY: bench-storage
-bench-storage: benchstat
-	@mkdir -p _output
+bench-storage:
+	@mkdir -p $(OUTPUT_DIR)
 ifneq ("$(HAS_BENCH_STORAGE)","")
-	@mv _output/bench_storage.txt _output/bench_storage.old.txt
+	@mv $(OUTPUT_DIR)/bench_storage.txt $(OUTPUT_DIR)/bench_storage.old.txt
 endif
-	@go test ./pkg/storage/ -bench=. -run=^$ -benchmem -count 5 -timeout 1h | tee _output/bench_storage.txt
+	@go test ./pkg/storage/ -bench=. -run=^$ -benchmem -count 5 -timeout 1h | tee $(OUTPUT_DIR)/bench_storage.txt
 ifeq ("$(HAS_BENCH_STORAGE)","")
-	@cp _output/bench_storage.txt _output/bench_storage.old.txt
+	@cp $(OUTPUT_DIR)/bench_storage.txt $(OUTPUT_DIR)/bench_storage.old.txt
 endif
 	@echo
 	@echo 'Comparing versus previous run. When optimizing copy everything below this line and include in PR description.'
 	@echo
-	@benchstat _output/bench_storage.old.txt _output/bench_storage.txt
-
-HAS_BENCHSTAT:=$(shell which benchstat)
-.PHONY: benchstat
-benchstat:
-ifndef HAS_BENCHSTAT
-	@go install -mod=readonly golang.org/x/perf/cmd/benchstat
-endif
+	${BENCHSTAT_CLI} $(OUTPUT_DIR)/bench_storage.old.txt $(OUTPUT_DIR)/bench_storage.txt
 
 # Image tests
 # ------------
 
 .PHONY: test-image
 test-image: container
-	IMAGE=$(REGISTRY)/metrics-server-$(ARCH):$(CHECKSUM) EXPECTED_ARCH=$(ARCH) EXPECTED_VERSION=$(GIT_TAG) ./test/test-image.sh
+	CONTAINER_CLI=${CONTAINER_CLI} IMAGE=$(REGISTRY)/metrics-server-$(ARCH):$(CHECKSUM) EXPECTED_ARCH=$(ARCH) EXPECTED_VERSION=$(GIT_TAG) ./test/test-image.sh
+
 
 .PHONY: test-image-all
 test-image-all:
-	@for arch in $(ALL_ARCHITECTURES); do ARCH=$${arch} $(MAKE) test-image; done
+	@set -e;for arch in $(ALL_ARCHITECTURES); do ARCH=$${arch} $(MAKE) test-image; done
 
 # E2e tests
 # -----------
 
 .PHONY: test-e2e
-test-e2e: test-e2e-1.27
+test-e2e: test-e2e-1.33
 
 .PHONY: test-e2e-all
-test-e2e-all: test-e2e-1.27 test-e2e-1.26 test-e2e-1.25
+test-e2e-all: test-e2e-1.33 test-e2e-1.32 test-e2e-1.31
 
-.PHONY: test-e2e-1.27
-test-e2e-1.27:
-	NODE_IMAGE=kindest/node:v1.27.0@sha256:c6b22e613523b1af67d4bc8a0c38a4c3ea3a2b8fbc5b367ae36345c9cb844518 ./test/test-e2e.sh
+.PHONY: test-e2e-1.33
+test-e2e-1.33:
+	NODE_IMAGE=kindest/node:v1.33.1@sha256:050072256b9a903bd914c0b2866828150cb229cea0efe5892e2b644d5dd3b34f KIND_CONFIG="${PWD}/test/kind-config-with-sidecar-containers.yaml" ./test/test-e2e.sh
 
-.PHONY: test-e2e-1.26
-test-e2e-1.26:
-	NODE_IMAGE=kindest/node:v1.26.3@sha256:61b92f38dff6ccc29969e7aa154d34e38b89443af1a2c14e6cfbd2df6419c66f ./test/test-e2e.sh
+.PHONY: test-e2e-1.32
+test-e2e-1.32:
+	NODE_IMAGE=kindest/node:v1.32.5@sha256:e3b2327e3a5ab8c76f5ece68936e4cafaa82edf58486b769727ab0b3b97a5b0d KIND_CONFIG="${PWD}/test/kind-config-with-sidecar-containers.yaml" ./test/test-e2e.sh
 
-.PHONY: test-e2e-1.25
-test-e2e-1.25:
-	NODE_IMAGE=kindest/node:v1.25.8@sha256:00d3f5314cc35327706776e95b2f8e504198ce59ac545d0200a89e69fce10b7f ./test/test-e2e.sh
+.PHONY: test-e2e-1.31
+test-e2e-1.31:
+	NODE_IMAGE=kindest/node:v1.31.9@sha256:b94a3a6c06198d17f59cca8c6f486236fa05e2fb359cbd75dabbfc348a10b211 KIND_CONFIG="${PWD}/test/kind-config-with-sidecar-containers.yaml" ./test/test-e2e.sh
 
 .PHONY: test-e2e-ha
 test-e2e-ha:
@@ -196,31 +224,24 @@ update: update-licenses update-lint update-toc update-deps update-generated
 # License
 # -------
 
-HAS_ADDLICENSE:=$(shell which addlicense)
 .PHONY: verify-licenses
-verify-licenses:addlicense
-	find -type f -name "*.go" ! -path "*/vendor/*" | xargs $(GOPATH)/bin/addlicense -check || (echo 'Run "make update"' && exit 1)
+verify-licenses:
+	find -type f -name "*.go" ! -path "*/vendor/*" | xargs ${ADDLICENSE_CLI} -check || (echo 'Run "make update"' && exit 1)
 
 .PHONY: update-licenses
-update-licenses: addlicense
-	find -type f -name "*.go" ! -path "*/vendor/*" | xargs $(GOPATH)/bin/addlicense -c "The Kubernetes Authors."
-
-.PHONY: addlicense
-addlicense:
-ifndef HAS_ADDLICENSE
-	go install -mod=readonly github.com/google/addlicense
-endif
+update-licenses:
+	find -type f -name "*.go" ! -path "*/vendor/*" | xargs ${ADDLICENSE_CLI} -c "The Kubernetes Authors."
 
 # Lint
 # ----
 
 .PHONY: verify-lint
 verify-lint: golangci
-	$(GOPATH)/bin/golangci-lint run --timeout 10m --modules-download-mode=readonly || (echo 'Run "make update"' && exit 1)
+	$(GOPATH)/bin/golangci-lint run || (echo 'Run "make update"' && exit 1)
 
 .PHONY: update-lint
 update-lint: golangci
-	$(GOPATH)/bin/golangci-lint run --fix --modules-download-mode=readonly
+	$(GOPATH)/bin/golangci-lint run --fix
 
 HAS_GOLANGCI_VERSION:=$(shell $(GOPATH)/bin/golangci-lint version --format=short > /dev/null 2>&1)
 .PHONY: golangci
@@ -235,33 +256,19 @@ endif
 docs_with_toc=FAQ.md KNOWN_ISSUES.md
 
 .PHONY: verify-toc
-verify-toc: mdtoc $(docs_with_toc)
-	$(GOPATH)/bin/mdtoc --inplace --dryrun $(docs_with_toc)
+verify-toc: $(docs_with_toc)
+	${MDTOC_CLI} --inplace --dryrun $(docs_with_toc)
 
 .PHONY: update-toc
-update-toc: mdtoc $(docs_with_toc)
-	$(GOPATH)/bin/mdtoc --inplace $(docs_with_toc)
-
-HAS_MDTOC:=$(shell which mdtoc)
-.PHONY: mdtoc
-mdtoc:
-ifndef HAS_MDTOC
-	go install -mod=readonly sigs.k8s.io/mdtoc
-endif
+update-toc: $(docs_with_toc)
+	${MDTOC_CLI} --inplace $(docs_with_toc)
 
 # Structured Logging
 # -----------------
 
 .PHONY: verify-structured-logging
-verify-structured-logging: logcheck
-	$(GOPATH)/bin/logcheck ./... || (echo 'Fix structured logging' && exit 1)
-
-HAS_LOGCHECK:=$(shell which logcheck)
-.PHONY: logcheck
-logcheck:
-ifndef HAS_LOGCHECK
-	go install -mod=readonly sigs.k8s.io/logtools/logcheck
-endif
+verify-structured-logging:
+	${LOGCHECK_CLI} ./... || (echo 'Fix structured logging' && exit 1)
 
 # Dependencies
 # ------------
@@ -288,8 +295,13 @@ verify-generated: update-generated
 .PHONY: update-generated
 update-generated:
 	# pkg/api/generated/openapi/zz_generated.openapi.go
-	go install -mod=readonly k8s.io/kube-openapi/cmd/openapi-gen
-	$(GOPATH)/bin/openapi-gen -i k8s.io/metrics/pkg/apis/metrics/v1beta1,k8s.io/apimachinery/pkg/apis/meta/v1,k8s.io/apimachinery/pkg/api/resource,k8s.io/apimachinery/pkg/version -p pkg/api/generated/openapi/ -O zz_generated.openapi -o $(REPO_DIR) -h $(REPO_DIR)/scripts/boilerplate.go.txt -r /dev/null
+	${OPENAPIGEN_CLI}\
+		--output-pkg github.com/kubernetes-sigs/metrics-server/pkg/api/generated/openapi/\
+		--output-file=zz_generated.openapi.go\
+		--output-dir=$(REPO_DIR)/pkg/api/generated/openapi\
+		--go-header-file $(REPO_DIR)/scripts/boilerplate.go.txt\
+		--report-filename /dev/null\
+		k8s.io/metrics/pkg/apis/metrics/v1beta1 k8s.io/apimachinery/pkg/apis/meta/v1 k8s.io/apimachinery/pkg/api/resource k8s.io/apimachinery/pkg/version
 
 # Deprecated
 # ----------
@@ -303,4 +315,4 @@ test-version: test-image-all
 
 .PHONY: clean
 clean:
-	rm -rf _output
+	rm -rf $(OUTPUT_DIR)
